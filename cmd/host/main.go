@@ -1,7 +1,8 @@
-// Command agent is the machine-side handler (cmd/agent).
+// Command host runs on the machine whose Chrome is shared (cmd/host).
 //
-// It runs on the machine whose Chrome will be connected to. Generic: it makes no assumption
-// about who connects or why.
+// It is the "host" end of the paired host/client tools: it runs on the user's machine, launches
+// Chrome, and exposes its CDP port on the mesh so the operator's `client` can attach. Generic: it
+// makes no assumption about who connects or why.
 //
 // Flow: consent gate → launch Chrome with a fresh temp profile + CDP port →
 // join the ephemeral mesh (ephlink) and expose the CDP port by MagicDNS name →
@@ -38,15 +39,15 @@ type config struct {
 func newRootCmd() *cobra.Command {
 	cfg := &config{}
 	cmd := &cobra.Command{
-		Use:   "agent",
-		Short: "Expose this machine's Chrome to a remote peer over an ephemeral mesh (CDP).",
-		Long: "agent launches a Chrome instance with the DevTools Protocol enabled and exposes it " +
+		Use:   "host",
+		Short: "Share this machine's Chrome with a remote client over an ephemeral mesh (CDP).",
+		Long: "host launches a Chrome instance with the DevTools Protocol enabled and exposes it " +
 			"on an ephemeral Tailscale mesh (via embedded tsnet — no separate Tailscale install " +
 			"needed), then tears everything down when you quit. A consent gate is shown before " +
-			"anything is exposed.",
-		Example: "  agent --operator ops --authkey $KEY   # join the mesh + expose Chrome\n" +
-			"  agent --local-only                    # loopback only (local testing)\n" +
-			"  agent --yes --headless --authkey $KEY # supervised automation / smoke test",
+			"anything is exposed. Its paired tool, `client`, attaches from the operator's machine.",
+		Example: "  host --operator ops --authkey $KEY   # join the mesh + expose Chrome\n" +
+			"  host --local-only                    # loopback only (local testing)\n" +
+			"  host --yes --headless --authkey $KEY # supervised automation / smoke test",
 		SilenceUsage:  true, // fang renders errors; don't dump usage on RunE error
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -64,7 +65,7 @@ func newRootCmd() *cobra.Command {
 	f.BoolVar(&cfg.skipConsent, "yes", false, "skip the interactive consent prompt (supervised automation / smoke tests)")
 	f.BoolVar(&cfg.localOnly, "local-only", false, "do not expose on the tailnet (loopback CDP only; for local testing)")
 	f.StringVar(&cfg.authKey, "authkey", "", "ephemeral mesh auth key (from the `mint` tool / $TS_AUTHKEY)")
-	f.StringVar(&cfg.hostname, "hostname", "cdp-agent", "MagicDNS hostname for this node on the mesh")
+	f.StringVar(&cfg.hostname, "hostname", "cdp-host", "MagicDNS hostname for this node on the mesh")
 	return cmd
 }
 
@@ -132,8 +133,8 @@ func run(ctx context.Context, cfg *config) error {
 		if err := node.Expose(fmt.Sprintf("127.0.0.1:%d", cfg.port), cfg.port); err != nil {
 			return err
 		}
-		host, ip4 := node.Name()
-		fmt.Fprintf(os.Stderr, "joined mesh as %q (ephemeral) — hub connects by MagicDNS name: --peer %s:%d  (ip %s)\n", host, host, cfg.port, ip4)
+		nodeName, ip4 := node.Name()
+		fmt.Fprintf(os.Stderr, "joined mesh as %q (ephemeral) — client connects by MagicDNS name: --peer %s:%d  (ip %s)\n", nodeName, nodeName, cfg.port, ip4)
 	}
 
 	// 4. Hold open until the context is cancelled (Ctrl+C via fang); defers tear down.

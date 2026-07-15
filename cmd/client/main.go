@@ -1,12 +1,13 @@
-// Command cdphub is the operator-side CDP consumer of the ephlink mesh.
+// Command client is the operator-side CDP consumer of the ephlink mesh (cmd/client).
 //
-// It joins the ephemeral mesh (ephlink), then re-serves a peer agent's Chrome CDP endpoint as a
+// It is the "client" end of the paired host/client tools: it runs on the operator's machine,
+// joins the ephemeral mesh (ephlink), then re-serves a peer host's Chrome CDP endpoint as a
 // LOCAL endpoint (ws://localhost:PORT + /json*) so any CDP client (Playwright, chrome-devtools
 // MCP, raw scripts) attaches unchanged. The ONLY CDP-specific logic here is the Chrome-≥94
 // `Host` rewrite + `webSocketDebuggerUrl` rewrite — done with stdlib httputil.ReverseProxy whose
-// Transport dials the agent over the mesh by MagicDNS name.
+// Transport dials the host over the mesh by MagicDNS name.
 //
-// ephlink carries the transport; cdphub is just its CDP-flavored consumer.
+// ephlink carries the transport; client is just its CDP-flavored consumer.
 package main
 
 import (
@@ -35,12 +36,13 @@ func main() {
 		authKey   string
 	)
 	cmd := &cobra.Command{
-		Use:   "cdphub",
-		Short: "Join the ephemeral mesh and re-serve a peer agent's Chrome CDP locally.",
-		Long: "cdphub joins the ephemeral mesh, dials a peer agent by its MagicDNS name, and " +
-			"re-serves that agent's Chrome DevTools Protocol endpoint at a local address with the " +
-			"Chrome Host/webSocketDebuggerUrl rewrite, so any CDP client can attach.",
-		Example:       "  cdphub --peer cdp-agent:9222 --local-port 9333",
+		Use:   "client",
+		Short: "Join the ephemeral mesh and re-serve a peer host's Chrome CDP locally.",
+		Long: "client joins the ephemeral mesh, dials a peer host by its MagicDNS name, and " +
+			"re-serves that host's Chrome DevTools Protocol endpoint at a local address with the " +
+			"Chrome Host/webSocketDebuggerUrl rewrite, so any CDP client can attach. Its paired " +
+			"tool, `host`, runs on the machine whose Chrome is shared.",
+		Example:       "  client --peer cdp-host:9222 --local-port 9333",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -52,15 +54,15 @@ func main() {
 				return fmt.Errorf("no auth key: pass --authkey (or $TS_AUTHKEY); mint one with the `mint` tool")
 			}
 			if peer == "" {
-				return fmt.Errorf("--peer is required, e.g. --peer cdp-agent:9222")
+				return fmt.Errorf("--peer is required, e.g. --peer cdp-host:9222")
 			}
 			return run(cmd.Context(), key, hostname, peer, localPort)
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&peer, "peer", "", "peer agent to reach by MagicDNS name:port (e.g. cdp-agent:9222)")
+	f.StringVar(&peer, "peer", "", "peer host to reach by MagicDNS name:port (e.g. cdp-host:9222)")
 	f.IntVar(&localPort, "local-port", 0, "local port to re-serve on (0 = OS picks)")
-	f.StringVar(&hostname, "hostname", "cdp-hub", "MagicDNS hostname for this node on the mesh")
+	f.StringVar(&hostname, "hostname", "cdp-client", "MagicDNS hostname for this node on the mesh")
 	f.StringVar(&authKey, "authkey", "", "ephemeral mesh auth key (from the `mint` tool / $TS_AUTHKEY)")
 
 	if err := fang.Execute(context.Background(), cmd, fang.WithVersion(version), fang.WithNotifySignal(os.Interrupt)); err != nil {

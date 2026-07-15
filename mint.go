@@ -14,7 +14,7 @@ import (
 type MintOptions struct {
 	// OAuthSecret is a Tailscale OAuth client secret with the auth_keys write scope.
 	OAuthSecret string
-	// Tags the minted key (and thus the joining node) will carry, e.g. []string{"tag:cdp-agent"}.
+	// Tags the minted key (and thus the joining node) will carry, e.g. []string{"tag:ephlink-host"}.
 	Tags []string
 	// Expiry of the key; 0 = a sane short default (30m).
 	Expiry time.Duration

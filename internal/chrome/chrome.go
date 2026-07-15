@@ -1,6 +1,6 @@
 // Package chrome locates and launches a Chrome/Chromium instance with the CDP remote-debugging
 // port enabled, using a throwaway profile. It is transport-agnostic: it only knows
-// how to get a local Chrome speaking CDP on 127.0.0.1:<port>. Exposing that port to a hub is the
+// how to get a local Chrome speaking CDP on 127.0.0.1:<port>. Exposing that port to a client is the
 // caller's job.
 package chrome
 
@@ -123,7 +123,7 @@ func Launch(opts LaunchOptions) (*Instance, error) {
 		return nil, err
 	}
 
-	profileDir, err := os.MkdirTemp("", "ephlink-agent-profile-*")
+	profileDir, err := os.MkdirTemp("", "ephlink-host-profile-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp profile: %w", err)
 	}

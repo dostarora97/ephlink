@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//	TS_OAUTH_CLIENT_SECRET=tskey-client-xxx mint [--tag tag:cdp-agent] [--expiry 30m]
+//	TS_OAUTH_CLIENT_SECRET=tskey-client-xxx mint [--tag tag:ephlink-host] [--expiry 30m]
 package main
 
 import (
@@ -65,7 +65,7 @@ func main() {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&tag, "tag", "tag:ephlink-agent", "tag to assign to the minted key")
+	cmd.Flags().StringVar(&tag, "tag", "tag:ephlink-host", "tag to assign to the minted key")
 	cmd.Flags().DurationVar(&expiry, "expiry", 30*time.Minute, "key expiry")
 
 	if err := cmd.ExecuteContext(context.Background()); err != nil {

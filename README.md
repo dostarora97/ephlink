@@ -20,13 +20,15 @@ The `cmd/` binaries use ephlink to **connect to a live user's real Chrome over t
 ```mermaid
 flowchart LR
     chrome["user's real Chrome<br/>(CDP debug port)"]
-    agent["agent<br/>chrome.Launch + ephlink.Expose"]
-    hub["cdphub<br/>ephlink.Dial + CDP rewrite<br/>→ ws://localhost:PORT"]
+    host["host<br/>chrome.Launch + ephlink.Expose"]
+    client["client<br/>ephlink.Dial + CDP rewrite<br/>→ ws://localhost:PORT"]
     clients["raw scripts · Playwright ·<br/>chrome-devtools MCP · LLM"]
-    chrome -->|CDP| agent
-    agent -->|"ephlink mesh (WireGuard e2e, embedded tsnet, MagicDNS)"| hub
-    hub -->|"local CDP endpoint (Host: localhost rewrite)"| clients
+    chrome -->|CDP| host
+    host -->|"ephlink mesh (WireGuard e2e, embedded tsnet, MagicDNS)"| client
+    client -->|"local CDP endpoint (Host: localhost rewrite)"| clients
 ```
+
+The two binaries are a matched pair: **`host`** runs on the user's machine (shares their Chrome), **`client`** runs on the operator's machine (attaches to it).
 
 ## Repository map
 
@@ -35,10 +37,10 @@ Single Go module (`github.com/dostarora97/ephlink`): the library is the root pac
 | Path | What it is |
 | --- | --- |
 | `link.go`, `mint.go` | The `ephlink` library (root package). Symmetric API — `Join` / `Expose` / `Dial` / `Serve` / `Mint`. Knows nothing about CDP. |
-| [`cmd/agent`](cmd/agent/README.md) | Runs on the Chrome machine: consent gate → launch Chrome → expose its CDP port on the mesh. |
-| [`cmd/cdphub`](cmd/cdphub/README.md) | Operator side: dial the agent, rewrite CDP, re-serve as `ws://localhost:PORT`. |
+| [`cmd/host`](cmd/host/README.md) | Runs on the user's Chrome machine: consent gate → launch Chrome → expose its CDP port on the mesh. |
+| [`cmd/client`](cmd/client/README.md) | Runs on the operator's machine: dial the host, rewrite CDP, re-serve as `ws://localhost:PORT`. |
 | `cmd/mint` | Operator-side minter for short-lived ephemeral mesh keys (thin CLI over `ephlink.Mint`). |
-| `internal/chrome`, `internal/consent` | Support packages for the agent (Chrome discovery/launch; the consent gate). |
+| `internal/chrome`, `internal/consent` | Support packages for the host (Chrome discovery/launch; the consent gate). |
 | [`docs/LIBRARY.md`](docs/LIBRARY.md) | The `ephlink` library reference. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Architecture and the full design & decision history (trade-offs, rejected alternatives, evolution). |
 | [`docs/TAILSCALE-SETUP.md`](docs/TAILSCALE-SETUP.md) | One-time tailnet setup (tags + OAuth client) needed for the mesh path. |
@@ -46,7 +48,7 @@ Single Go module (`github.com/dostarora97/ephlink`): the library is the root pac
 ## Prerequisites
 
 - **Go 1.26+**.
-- **Google Chrome / Chromium / Edge** on the agent machine (auto-detected on macOS/Linux/Windows; override with `--chrome-path`).
+- **Google Chrome / Chromium / Edge** on the host machine (auto-detected on macOS/Linux/Windows; override with `--chrome-path`).
 - For the **mesh path only:** a Tailscale account and a one-time setup — see [Tailscale setup](docs/TAILSCALE-SETUP.md). The loopback quickstart below needs none of this.
 - Optional, for driving: Node + [Playwright](https://playwright.dev), or the chrome-devtools MCP.
 
@@ -57,26 +59,26 @@ One module, three binaries:
 ```sh
 git clone https://github.com/dostarora97/ephlink && cd ephlink
 go build ./...                       # library + all binaries
-go build -o agent  ./cmd/agent       # or build them individually
-go build -o cdphub ./cmd/cdphub
+go build -o host   ./cmd/host       # or build them individually
+go build -o client ./cmd/client
 go build -o mint   ./cmd/mint
 ```
 
 Or install a binary straight from the module path:
 
 ```sh
-go install github.com/dostarora97/ephlink/cmd/agent@latest
+go install github.com/dostarora97/ephlink/cmd/host@latest
 ```
 
 For release-style cross-platform archives, see [Releasing](#releasing).
 
 ## Quickstart A — loopback (no tailnet, one machine)
 
-Prove the CDP seam end-to-end with zero Tailscale setup. The agent launches Chrome and exposes CDP only on loopback; point any client at it.
+Prove the CDP seam end-to-end with zero Tailscale setup. `host` launches Chrome and exposes CDP only on loopback; point any client at it.
 
 ```sh
 # terminal 1: launch Chrome with CDP on 127.0.0.1:9222, skip the mesh
-./agent --local-only --yes --cdp-port 9222
+./host --local-only --yes --cdp-port 9222
 
 # terminal 2: attach any CDP client
 #   Playwright:  const b = await chromium.connectOverCDP("http://127.0.0.1:9222")
@@ -87,29 +89,29 @@ Use `--headless` to run Chrome without a window (smoke tests). Ctrl-C in termina
 
 ## Quickstart B — over the mesh (two machines)
 
-The real thing: the agent runs on the **user's** machine, the hub + clients on the **operator's**. Do the [one-time Tailscale setup](docs/TAILSCALE-SETUP.md) first (tags + OAuth client).
+The real thing: `host` runs on the **user's** machine, `client` + the CDP clients on the **operator's**. Do the [one-time Tailscale setup](docs/TAILSCALE-SETUP.md) first (tags + OAuth client).
 
 ```sh
 # ── operator: mint a short-lived ephemeral key ─────────────────────────────
 export TS_OAUTH_CLIENT_SECRET=tskey-client-xxxxx     # or put it in .env (see .env.example)
-KEY=$(./mint --expiry 30m)                           # defaults to --tag tag:ephlink-agent
+HOSTKEY=$(./mint --expiry 30m)                       # defaults to --tag tag:ephlink-host
 
 # ── user's machine: accept consent, launch Chrome, join the mesh ───────────
-./agent --authkey "$KEY" --operator "support"        # hostname defaults to cdp-agent
+./host --authkey "$HOSTKEY" --operator "support"     # hostname defaults to cdp-host
 
-# ── operator: dial the agent by name, re-serve CDP locally ─────────────────
-HUBKEY=$(./mint --expiry 30m)                        # the hub joins the mesh too → its own key
-./cdphub --peer cdp-agent:9222 --local-port 9333 --authkey "$HUBKEY"
+# ── operator: dial the host by name, re-serve CDP locally ──────────────────
+CLIENTKEY=$(./mint --expiry 30m)                     # the client joins the mesh too → its own key
+./client --peer cdp-host:9222 --local-port 9333 --authkey "$CLIENTKEY"
 
 # ── operator: attach any client to the local endpoint ──────────────────────
 #   chromium.connectOverCDP("http://127.0.0.1:9333")
 ```
 
-Both nodes join as **ephemeral** — they auto-deregister from the tailnet on exit. Quit / Ctrl-C on the agent runs the full teardown: kill Chrome, delete the temp profile, drop the mesh node. See [`docs/DESIGN.md` → Teardown (D12)](docs/DESIGN.md) for the guarantees.
+Both nodes join as **ephemeral** — they auto-deregister from the tailnet on exit. Quit / Ctrl-C on the host runs the full teardown: kill Chrome, delete the temp profile, drop the mesh node. See [`docs/DESIGN.md` → Teardown (D12)](docs/DESIGN.md) for the guarantees.
 
 ## CLI reference
 
-**agent** — runs where Chrome is.
+**host** — runs on the user's machine, where Chrome is.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -117,23 +119,23 @@ Both nodes join as **ephemeral** — they auto-deregister from the tailnet on ex
 | `--operator` | `""` | Free-text label for who's connecting (shown in the consent prompt). |
 | `--ttl` | `30 minutes` | Human-readable session duration (shown in consent). |
 | `--cdp-port` | `9222` | Local CDP port for the launched Chrome. |
-| `--hostname` | `cdp-agent` | MagicDNS name for this node (the hub dials this). |
+| `--hostname` | `cdp-host` | MagicDNS name for this node (the client dials this). |
 | `--headless` | `false` | Run Chrome headless (smoke tests; real sessions are headful). |
 | `--chrome-path` | auto | Override the Chrome executable. |
 | `--active` | `true` | Allow the operator to actively drive, not just observe. |
 | `--yes` | `false` | Skip the interactive consent prompt (supervised automation). |
 | `--local-only` | `false` | Don't touch the mesh — loopback CDP only (Quickstart A). |
 
-**mint** — operator side. `mint [--tag tag:ephlink-agent] [--expiry 30m]`, reads `TS_OAUTH_CLIENT_SECRET` (or `.env`), prints a key.
+**mint** — operator side. `mint [--tag tag:ephlink-host] [--expiry 30m]`, reads `TS_OAUTH_CLIENT_SECRET` (or `.env`), prints a key.
 
-**cdphub** — operator side.
+**client** — operator side.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--peer` | — | Agent to reach, `MagicDNS-name:port` (e.g. `cdp-agent:9222`). |
+| `--peer` | — | Host to reach, `MagicDNS-name:port` (e.g. `cdp-host:9222`). |
 | `--local-port` | `0` (OS picks) | Local port to re-serve CDP on. |
-| `--hostname` | `cdp-hub` | MagicDNS name for the hub node. |
-| `--authkey` (`$TS_AUTHKEY`) | — | Ephemeral mesh key for the hub. |
+| `--hostname` | `cdp-client` | MagicDNS name for the client node. |
+| `--authkey` (`$TS_AUTHKEY`) | — | Ephemeral mesh key for the client. |
 
 ## Configuration
 
@@ -155,9 +157,9 @@ Pushing a `vX.Y.Z` tag triggers the [release workflow](.github/workflows/release
 ## Troubleshooting
 
 - **"no Chrome/Chromium/Edge found"** — install a Chromium-family browser or pass `--chrome-path`.
-- **"the CDP port … is already in use"** — the agent launches its *own* Chrome with the debug port; it does not attach to a Chrome that's already running. That message means something (often your own running Chrome) already holds the port. Quit it or pass a free `--cdp-port`. Note: you cannot enable remote debugging on an already-running Chrome via `chrome://inspect/#remote-debugging` — that page only forwards to targets that already expose a port; it does not turn one on for the browser you're viewing. (See [`docs/DESIGN.md` → Chrome profile (D4)](docs/DESIGN.md).)
+- **"the CDP port … is already in use"** — `host` launches its *own* Chrome with the debug port; it does not attach to a Chrome that's already running. That message means something (often your own running Chrome) already holds the port. Quit it or pass a free `--cdp-port`. Note: you cannot enable remote debugging on an already-running Chrome via `chrome://inspect/#remote-debugging` — that page only forwards to targets that already expose a port; it does not turn one on for the browser you're viewing. (See [`docs/DESIGN.md` → Chrome profile (D4)](docs/DESIGN.md).)
 - **Mesh join fails / hangs** — the key is expired or wrong (they're short-lived by design; mint a fresh one), or the [Tailscale tags/OAuth setup](docs/TAILSCALE-SETUP.md) isn't in place.
-- **Client can't attach to the local endpoint** — confirm `cdphub` printed its local port and that `--peer` matches the agent's `--hostname` and `--cdp-port`.
+- **Client can't attach to the local endpoint** — confirm `client` printed its local port and that `--peer` matches the host's `--hostname` and `--cdp-port`.
 - **`goreleaser` publish 401** — the token/host must match your GitHub instance; on GitHub Enterprise, set the API/upload URLs in `github_urls`. Actions may be disabled on some hosts.
 
 ## Security posture

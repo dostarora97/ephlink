@@ -32,7 +32,7 @@ import (
 
 // Config configures a node joining the mesh. Symmetric: both sides pass the same shape.
 type Config struct {
-	// Hostname is this node's MagicDNS name on the tailnet (e.g. "cdp-agent", "cdp-hub").
+	// Hostname is this node's MagicDNS name on the tailnet (e.g. "cdp-host", "cdp-client").
 	Hostname string
 	// AuthKey is an ephemeral, pre-authorized (optionally tagged) key. See Mint().
 	AuthKey string
@@ -110,7 +110,7 @@ func (n *Node) Expose(localAddr string, port int) error {
 	return nil
 }
 
-// Dial opens a raw TCP connection to a peer's service by name or IP (e.g. "cdp-agent:9222" or
+// Dial opens a raw TCP connection to a peer's service by name or IP (e.g. "cdp-host:9222" or
 // "100.x.y.z:9222"). If the host is a name, it is resolved to the peer's tailnet IP via the mesh
 // peer list (more robust than relying on tsnet's internal MagicDNS resolver, which can lag for
 // freshly-joined ephemeral peers). Retries briefly to allow peer propagation.

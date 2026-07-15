@@ -10,10 +10,10 @@ version: 2
 project_name: ephlink
 
 builds:
-  # --- agent: runs on the machine whose Chrome is exposed ---
-  - id: agent
-    main: ./cmd/agent
-    binary: agent
+  # --- host: runs on the machine whose Chrome is shared ---
+  - id: host
+    main: ./cmd/host
+    binary: host
     env: [CGO_ENABLED=0]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
@@ -33,10 +33,10 @@ builds:
     ldflags: [-s -w]
     mod_timestamp: "{{ .CommitTimestamp }}"
 
-  # --- cdphub: operator-side CDP consumer ---
-  - id: cdphub
-    main: ./cmd/cdphub
-    binary: cdphub
+  # --- client: operator-side CDP consumer ---
+  - id: client
+    main: ./cmd/client
+    binary: client
     env: [CGO_ENABLED=0]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
@@ -47,7 +47,7 @@ builds:
 
 archives:
   - id: default
-    ids: [agent, mint, cdphub]
+    ids: [host, mint, client]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
@@ -92,7 +92,7 @@ release:
 #
 # signs:               # Windows (osslsigncode) — gated on the cert env var being present
 #   - id: windows
-#     ids: [agent, mint, cdphub]
+#     ids: [host, mint, client]
 #     if: '{{ isEnvSet "WINDOWS_CERT_FILE" }}'
 #     signature: "${artifact}.sig"
 #     cmd: osslsigncode
