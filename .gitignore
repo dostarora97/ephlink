@@ -1,0 +1,26 @@
+# Claude's literal playground — scripts, downloads, cloned repos, scratch notes, test data.
+# Never committed. Safe to delete anytime.
+.playground/
+
+# Captures are live-credential bearer artifacts (D9). Never commit.
+captures/
+*.har
+*.cdp-capture
+
+# Secrets / keys — never commit (Tailscale auth keys, OAuth secrets)
+*.authkey
+.env
+.env.*
+!.env.example
+secrets/
+
+# Go — compiled binaries (built in-tree during dev) + release output
+/agent
+/cdphub
+/mint
+*.exe
+dist/
+
+# OS / editor
+.DS_Store
+*.swp

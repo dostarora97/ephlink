@@ -1,0 +1,40 @@
+name: release
+
+# Runs GoReleaser when a version tag is pushed, publishing binaries to a GitHub Release.
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for the changelog
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          # The default GITHUB_TOKEN works for Releases on github.com and GitHub Enterprise.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # When signing is enabled later (design D11c), add the cert secrets here:
+          #   MACOS_SIGN_P12, MACOS_SIGN_PASSWORD, MACOS_NOTARY_ISSUER_ID, MACOS_NOTARY_KEY_ID,
+          #   MACOS_NOTARY_KEY, WINDOWS_CERT_FILE, WINDOWS_CERT_PASSWORD
+
+# CI note: single Go module; GoReleaser builds the three binaries from ./cmd/*.

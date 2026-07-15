@@ -1,0 +1,99 @@
+# GoReleaser config for ephlink (schema v2).
+# Single Go module; the three binaries are built from ./cmd/*.
+#
+# Local dev:   goreleaser build --snapshot --clean --single-target
+# Full local:  goreleaser release --snapshot --clean   (builds all platforms, no publish)
+# Real release: push a tag `vX.Y.Z` → GitHub Actions runs `goreleaser release` (see .github/),
+#               or run `goreleaser release --clean` locally with GITHUB_TOKEN set.
+version: 2
+
+project_name: ephlink
+
+builds:
+  # --- agent: runs on the machine whose Chrome is exposed ---
+  - id: agent
+    main: ./cmd/agent
+    binary: agent
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.CommitDate}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  # --- mint: operator-side ephemeral-key minter ---
+  - id: mint
+    main: ./cmd/mint
+    binary: mint
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  # --- cdphub: operator-side CDP consumer ---
+  - id: cdphub
+    main: ./cmd/cdphub
+    binary: cdphub
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.CommitDate}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    ids: [agent, mint, cdphub]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE*
+      - docs/TAILSCALE-SETUP.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev"
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^chore:", "^test:", "Merge pull request", "Merge branch"]
+
+release:
+  # Repo is auto-detected from the git remote — no host/owner hardcoded, so this stays portable
+  # if the remote changes. Publishes a Release with the archives + checksums.
+  draft: false
+  prerelease: auto
+
+# ── Code signing (DISABLED until certs exist — design D11c). ──────────────────────────────
+# macOS notarization needs an Apple Developer ID cert ($99/yr); Windows needs a code-signing
+# cert. When available, uncomment and wire the env vars. Until then, binaries are UNSIGNED
+# (users get an OS "unidentified developer" warning — acceptable for internal/supervised use).
+#
+# notarize:            # macOS (GoReleaser Pro) — or use a signs: hook with rcodesign/notarytool
+#   macos:
+#     - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+#       sign:
+#         certificate: "{{.Env.MACOS_SIGN_P12}}"
+#         password: "{{.Env.MACOS_SIGN_PASSWORD}}"
+#       notarize:
+#         issuer_id: "{{.Env.MACOS_NOTARY_ISSUER_ID}}"
+#         key_id: "{{.Env.MACOS_NOTARY_KEY_ID}}"
+#         key: "{{.Env.MACOS_NOTARY_KEY}}"
+#
+# signs:               # Windows (osslsigncode) — gated on the cert env var being present
+#   - id: windows
+#     ids: [agent, mint, cdphub]
+#     if: '{{ isEnvSet "WINDOWS_CERT_FILE" }}'
+#     signature: "${artifact}.sig"
+#     cmd: osslsigncode
+#     args: ["sign", "-pkcs12", "{{.Env.WINDOWS_CERT_FILE}}", "-pass", "{{.Env.WINDOWS_CERT_PASSWORD}}", "-in", "{{ .Artifact }}", "-out", "${artifact}.signed"]
