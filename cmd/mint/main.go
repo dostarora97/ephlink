@@ -3,6 +3,8 @@
 //
 // SECURITY: the OAuth client secret stays here (operator side), never on a joining
 // node. The joining node receives only the resulting short-expiry ephemeral key.
+// Credential loading is explicit: TS_OAUTH_CLIENT_SECRET from the environment, ./.env, or
+// --env-file — never a parent-directory search.
 //
 // Usage:
 //
@@ -13,44 +15,33 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
 	"github.com/dostarora97/ephlink"
+	"github.com/dostarora97/ephlink/internal/envload"
 )
 
-// loadDotenv loads a .env file if present, searching cwd and up to 3 parent dirs (so it works
-// whether you run from the repo root or a subdir). Existing env vars are NOT overridden.
-func loadDotenv() {
-	dir, _ := os.Getwd()
-	for i := 0; i < 4 && dir != "" && dir != "/"; i++ {
-		p := filepath.Join(dir, ".env")
-		if _, err := os.Stat(p); err == nil {
-			_ = godotenv.Load(p)
-			return
-		}
-		dir = filepath.Dir(dir)
-	}
-}
-
 func main() {
-	loadDotenv()
 	var (
-		tag    string
-		expiry time.Duration
+		tag     string
+		expiry  time.Duration
+		envFile string
 	)
 	cmd := &cobra.Command{
 		Use:           "mint",
 		Short:         "Mint a short-lived ephemeral tagged auth key (operator side).",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Explicit credential loading: ./.env or --env-file only (never parent dirs); logs the source.
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			return envload.Load(envFile)
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			secret := os.Getenv("TS_OAUTH_CLIENT_SECRET")
 			if secret == "" {
-				return fmt.Errorf("set TS_OAUTH_CLIENT_SECRET (Tailscale OAuth client secret, scope: auth_keys)")
+				return fmt.Errorf("no TS_OAUTH_CLIENT_SECRET (Tailscale OAuth client secret, scope: auth_keys) — export it, put it in ./.env, or pass --env-file")
 			}
 			key, err := ephlink.Mint(cmd.Context(), ephlink.MintOptions{
 				OAuthSecret: secret,
@@ -67,6 +58,7 @@ func main() {
 	}
 	cmd.Flags().StringVar(&tag, "tag", "tag:ephlink-host", "tag to assign to the minted key")
 	cmd.Flags().DurationVar(&expiry, "expiry", 30*time.Minute, "key expiry")
+	cmd.Flags().StringVar(&envFile, "env-file", "", "path to a .env with TS_OAUTH_CLIENT_SECRET (default: ./.env if present, else ambient env)")
 
 	if err := cmd.ExecuteContext(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "mint:", err)

@@ -19,15 +19,14 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"time"
 
 	"charm.land/fang/v2"
-	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
 	"github.com/dostarora97/ephlink"
 	"github.com/dostarora97/ephlink/internal/cdp"
+	"github.com/dostarora97/ephlink/internal/envload"
 )
 
 var version = "0.1.0-dev"
@@ -35,37 +34,28 @@ var version = "0.1.0-dev"
 // hostTag is the tag every ephlink host node (and its minted key) carries.
 const hostTag = "tag:ephlink-host"
 
-// loadDotenv loads a .env file if present, searching cwd and up to 3 parent dirs. Existing env vars
-// are not overridden.
-func loadDotenv() {
-	dir, _ := os.Getwd()
-	for i := 0; i < 4 && dir != "" && dir != "/"; i++ {
-		p := filepath.Join(dir, ".env")
-		if _, err := os.Stat(p); err == nil {
-			_ = godotenv.Load(p)
-			return
-		}
-		dir = filepath.Dir(dir)
-	}
-}
-
 func oauthSecret() (string, error) {
 	s := os.Getenv("TS_OAUTH_CLIENT_SECRET")
 	if s == "" {
-		return "", fmt.Errorf("set TS_OAUTH_CLIENT_SECRET (Tailscale OAuth client secret; scopes: auth_keys, devices) — or put it in .env")
+		return "", fmt.Errorf("no TS_OAUTH_CLIENT_SECRET (Tailscale OAuth client secret; scopes: auth_keys, devices) — export it, put it in ./.env, or pass --env-file")
 	}
 	return s, nil
 }
 
 func main() {
-	loadDotenv()
+	var envFile string
 	root := &cobra.Command{
 		Use:           "client",
 		Short:         "Operator-side control plane for a fleet of ephlink CDP hosts.",
 		Long:          "client manages ephlink hosts — mint keys, list the fleet, remove nodes. It is not in the CDP data path: each host self-serves its own tailnet name, which consumers connect to directly.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// Explicit credential loading: ./.env or --env-file only (never parent dirs); logs the source.
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			return envload.Load(envFile)
+		},
 	}
+	root.PersistentFlags().StringVar(&envFile, "env-file", "", "path to a .env with TS_OAUTH_CLIENT_SECRET (default: ./.env if present, else ambient env)")
 	root.AddCommand(addCmd(), listCmd(), removeCmd(), serveCDPCmd())
 
 	if err := fang.Execute(context.Background(), root, fang.WithVersion(version), fang.WithNotifySignal(os.Interrupt)); err != nil {
