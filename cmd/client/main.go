@@ -181,30 +181,56 @@ func removeCmd() *cobra.Command {
 
 func serveCDPCmd() *cobra.Command {
 	var (
-		peer    string
-		port    int
-		authKey string
+		peer     string
+		port     int
+		authKey  string
+		printCmd bool
+		expiry   time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "serve-cdp <name>",
-		Short: "Re-present a raw host under cdp-host-<name> with the CDP rewrite applied.",
-		Long: "serve-cdp joins a node named cdp-host-<name>, listens on the mesh, and for each connection " +
-			"dials the raw host (--peer) over the mesh and applies the CDP Host/webSocketDebuggerUrl " +
-			"rewrite — so consumers attach to http://cdp-host-<name>.<tailnet>.ts.net:<port>. The raw " +
-			"host stays generic; all CDP logic is here, operator-side. Runs until Ctrl+C.",
+		Short: "One command: mint + print the host command, then re-present it with the CDP rewrite.",
+		Long: "serve-cdp is the one-command operator flow. By default it mints a host key and prints the " +
+			"`host` command to run on <name>'s machine, then joins a node cdp-host-<name>, waits for the " +
+			"raw host to come online, dials it over the mesh, applies the CDP Host/webSocketDebuggerUrl " +
+			"rewrite, and serves it at http://cdp-host-<name>.<tailnet>.ts.net:<port>. The raw host stays " +
+			"generic; all CDP logic is here, operator-side. Runs until Ctrl+C. Pass --no-print-host-cmd " +
+			"if the host is already running (e.g. you used `client add` earlier).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			presented := "cdp-host-" + name
+			srcHost := fmt.Sprintf("cdp-host-%s-src", name)
 			if peer == "" {
-				peer = fmt.Sprintf("cdp-host-%s-src:%d", name, port)
+				peer = fmt.Sprintf("%s:%d", srcHost, port)
 			}
+
+			// Mint + print the host command up front (unless told the host is already up).
+			if printCmd {
+				secret, err := oauthSecret()
+				if err != nil {
+					return err
+				}
+				hostKey, err := ephlink.Mint(cmd.Context(), ephlink.MintOptions{
+					OAuthSecret: secret,
+					Tags:        []string{hostTag},
+					Expiry:      expiry,
+					Description: "ephlink-host " + name,
+				})
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "Run this on %s's machine (key expires in %s):\n\n", name, expiry)
+				fmt.Fprintf(os.Stderr, "  host --authkey %s --hostname %s --operator ops\n\n", hostKey, srcHost)
+				fmt.Fprintf(os.Stderr, "Waiting for %s to come online, then serving here…\n\n", srcHost)
+			}
+
+			// The presenting node's own key (independent of the host key).
 			key := authKey
 			if key == "" {
 				key = os.Getenv("TS_AUTHKEY")
 			}
 			if key == "" {
-				// Mint a presenting-node key on the fly (client-side; needs auth_keys scope).
 				secret, err := oauthSecret()
 				if err != nil {
 					return fmt.Errorf("no --authkey/$TS_AUTHKEY and cannot mint: %w", err)
@@ -212,7 +238,7 @@ func serveCDPCmd() *cobra.Command {
 				key, err = ephlink.Mint(cmd.Context(), ephlink.MintOptions{
 					OAuthSecret: secret,
 					Tags:        []string{hostTag},
-					Expiry:      30 * time.Minute,
+					Expiry:      expiry,
 					Description: "ephlink-client " + name,
 				})
 				if err != nil {
@@ -231,7 +257,7 @@ func serveCDPCmd() *cobra.Command {
 			}
 			nodeName, ip4 := node.Name()
 			advertise := fmt.Sprintf("%s:%d", nodeName, port)
-			// Upstream is the raw host, reached over the mesh via this node's Dial.
+			// Upstream is the raw host, reached over the mesh via this node's Dial (retries until online).
 			dial := func(dctx context.Context) (net.Conn, error) { return node.Dial(dctx, peer) }
 			go func() { _ = cdp.Serve(ln, advertise, peer, dial) }()
 
@@ -246,5 +272,7 @@ func serveCDPCmd() *cobra.Command {
 	cmd.Flags().StringVar(&peer, "peer", "", "raw host to dial by MagicDNS name:port (default cdp-host-<name>-src:<port>)")
 	cmd.Flags().IntVar(&port, "cdp-port", 9222, "CDP port to dial on the raw host and serve on")
 	cmd.Flags().StringVar(&authKey, "authkey", "", "ephemeral mesh key for the presenting node (else $TS_AUTHKEY, else minted)")
+	cmd.Flags().BoolVar(&printCmd, "print-host-cmd", true, "mint + print the `host` command to run on the target machine (set --print-host-cmd=false if the host is already running)")
+	cmd.Flags().DurationVar(&expiry, "expiry", 30*time.Minute, "minted key expiry")
 	return cmd
 }
