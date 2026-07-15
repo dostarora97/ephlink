@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write # needed to create the GitHub Release
 
+# One release run per tag; a re-pushed tag cancels the older in-flight run (avoids duplicate uploads).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
