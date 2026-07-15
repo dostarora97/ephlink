@@ -15,12 +15,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 
 	"charm.land/fang/v2"
 	"github.com/spf13/cobra"
 
 	"github.com/dostarora97/ephlink"
+	"github.com/dostarora97/ephlink/internal/cdp"
 	"github.com/dostarora97/ephlink/internal/chrome"
 	"github.com/dostarora97/ephlink/internal/consent"
 )
@@ -113,10 +115,20 @@ func run(ctx context.Context, cfg *config) error {
 	defer inst.Close() // idempotent cleanup
 	fmt.Fprintf(os.Stderr, "Chrome up: CDP on 127.0.0.1:%d (temp profile %s)\n", inst.Port, inst.ProfileDir)
 
-	// 3. TRANSPORT: join the ephemeral mesh (ephlink) and expose the CDP port by name.
-	//    --local-only skips the mesh (loopback CDP only, for local testing).
+	// 3. Expose the CDP port. host stays GENERIC: on the mesh it does a raw expose (no CDP
+	//    knowledge — the operator's `client` applies the CDP rewrite and re-presents it). The
+	//    --local-only path runs the CDP rewrite locally for a zero-setup single-machine dev flow.
+	chromeAddr := fmt.Sprintf("127.0.0.1:%d", cfg.port)
 	if cfg.localOnly {
-		fmt.Fprintf(os.Stderr, "local-only mode: CDP reachable at 127.0.0.1:%d (no mesh exposure)\n", cfg.port)
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("local listen: %w", err)
+		}
+		defer ln.Close()
+		advertise := ln.Addr().String() // 127.0.0.1:<chosen-port>
+		fmt.Fprintf(os.Stderr, "local-only: rewritten CDP at http://%s  (Chrome CDP on %s)\n", advertise, chromeAddr)
+		fmt.Fprintf(os.Stderr, "  attach: chromium.connectOverCDP(\"http://%s\")  ·  curl http://%s/json/version\n", advertise, advertise)
+		go func() { _ = cdp.Serve(ln, advertise, chromeAddr, cdp.LocalDialer(chromeAddr)) }()
 	} else {
 		key := cfg.authKey
 		if key == "" {
@@ -130,11 +142,13 @@ func run(ctx context.Context, cfg *config) error {
 			return err
 		}
 		defer node.Close() // ephemeral node auto-deregisters; closes listeners + server
-		if err := node.Expose(fmt.Sprintf("127.0.0.1:%d", cfg.port), cfg.port); err != nil {
+		// Raw expose: bytes only. The operator's `client` dials this and applies the CDP rewrite.
+		if err := node.Expose(chromeAddr, cfg.port); err != nil {
 			return err
 		}
 		nodeName, ip4 := node.Name()
-		fmt.Fprintf(os.Stderr, "joined mesh as %q (ephemeral) — client connects by MagicDNS name: --peer %s:%d  (ip %s)\n", nodeName, nodeName, cfg.port, ip4)
+		fmt.Fprintf(os.Stderr, "joined mesh as %q (ephemeral, raw CDP expose on :%d) — ip %s\n", nodeName, cfg.port, ip4)
+		fmt.Fprintf(os.Stderr, "  operator: run `client` to re-present this host with the CDP rewrite under a tailnet name.\n")
 	}
 
 	// 4. Hold open until the context is cancelled (Ctrl+C via fang); defers tear down.

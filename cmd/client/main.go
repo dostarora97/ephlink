@@ -1,176 +1,250 @@
-// Command client is the operator-side CDP consumer of the ephlink mesh (cmd/client).
+// Command client is the operator-side tool for a fleet of ephlink CDP hosts.
 //
-// It is the "client" end of the paired host/client tools: it runs on the operator's machine,
-// joins the ephemeral mesh (ephlink), then re-serves a peer host's Chrome CDP endpoint as a
-// LOCAL endpoint (ws://localhost:PORT + /json*) so any CDP client (Playwright, chrome-devtools
-// MCP, raw scripts) attaches unchanged. The ONLY CDP-specific logic here is the Chrome-≥94
-// `Host` rewrite + `webSocketDebuggerUrl` rewrite — done with stdlib httputil.ReverseProxy whose
-// Transport dials the host over the mesh by MagicDNS name.
+// Hosts stay generic: each `host` does a RAW expose of its Chrome CDP port on its own mesh node
+// (no CDP knowledge). `client` is the operator-side transformer + re-presenter:
 //
-// ephlink carries the transport; client is just its CDP-flavored consumer.
+//	client add <name>       mint an ephemeral key + print the `host` command to run on <name>'s box
+//	client list             list ephlink hosts (from the Tailscale API, filtered by tag) + liveness
+//	client remove <name>    remove a host's node from the tailnet
+//	client serve-cdp <name>  join a node "cdp-host-<name>", dial the raw host over the mesh, apply the
+//	                        CDP rewrite, and serve it under that tailnet name for consumers to attach
+//
+// The control commands (add/list/remove) are STATELESS: the tailnet is the source of truth (no
+// local DB). They need a Tailscale OAuth client secret (TS_OAUTH_CLIENT_SECRET, or .env) with
+// auth_keys + devices scopes. `serve` needs an ephemeral key for the presenting node.
 package main
 
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
-	"net/http/httputil"
 	"os"
-	"strings"
+	"path/filepath"
+	"time"
 
 	"charm.land/fang/v2"
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
 	"github.com/dostarora97/ephlink"
+	"github.com/dostarora97/ephlink/internal/cdp"
 )
 
 var version = "0.1.0-dev"
 
+// hostTag is the tag every ephlink host node (and its minted key) carries.
+const hostTag = "tag:ephlink-host"
+
+// loadDotenv loads a .env file if present, searching cwd and up to 3 parent dirs. Existing env vars
+// are not overridden.
+func loadDotenv() {
+	dir, _ := os.Getwd()
+	for i := 0; i < 4 && dir != "" && dir != "/"; i++ {
+		p := filepath.Join(dir, ".env")
+		if _, err := os.Stat(p); err == nil {
+			_ = godotenv.Load(p)
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}
+
+func oauthSecret() (string, error) {
+	s := os.Getenv("TS_OAUTH_CLIENT_SECRET")
+	if s == "" {
+		return "", fmt.Errorf("set TS_OAUTH_CLIENT_SECRET (Tailscale OAuth client secret; scopes: auth_keys, devices) — or put it in .env")
+	}
+	return s, nil
+}
+
 func main() {
-	var (
-		peer      string
-		localPort int
-		hostname  string
-		authKey   string
-	)
-	cmd := &cobra.Command{
-		Use:   "client",
-		Short: "Join the ephemeral mesh and re-serve a peer host's Chrome CDP locally.",
-		Long: "client joins the ephemeral mesh, dials a peer host by its MagicDNS name, and " +
-			"re-serves that host's Chrome DevTools Protocol endpoint at a local address with the " +
-			"Chrome Host/webSocketDebuggerUrl rewrite, so any CDP client can attach. Its paired " +
-			"tool, `host`, runs on the machine whose Chrome is shared.",
-		Example:       "  client --peer cdp-host:9222 --local-port 9333",
+	loadDotenv()
+	root := &cobra.Command{
+		Use:           "client",
+		Short:         "Operator-side control plane for a fleet of ephlink CDP hosts.",
+		Long:          "client manages ephlink hosts — mint keys, list the fleet, remove nodes. It is not in the CDP data path: each host self-serves its own tailnet name, which consumers connect to directly.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+	}
+	root.AddCommand(addCmd(), listCmd(), removeCmd(), serveCDPCmd())
+
+	if err := fang.Execute(context.Background(), root, fang.WithVersion(version), fang.WithNotifySignal(os.Interrupt)); err != nil {
+		os.Exit(1)
+	}
+}
+
+func addCmd() *cobra.Command {
+	var (
+		port   int
+		expiry time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "add <name>",
+		Short: "Mint a key for a new host and print the command to run on its machine.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			secret, err := oauthSecret()
+			if err != nil {
+				return err
+			}
+			srcHost := "cdp-host-" + name + "-src" // the raw host node (bytes only)
+			presented := "cdp-host-" + name        // the name the client will present under
+			key, err := ephlink.Mint(cmd.Context(), ephlink.MintOptions{
+				OAuthSecret: secret,
+				Tags:        []string{hostTag},
+				Expiry:      expiry,
+				Description: "ephlink-host " + name, // association lives in the key (no local DB); ':' is rejected by the API
+			})
+			if err != nil {
+				return err
+			}
+			// The minted key must reach <name>'s machine out-of-band; print the exact command.
+			fmt.Printf("Host %q — run this on %s's machine (key expires in %s):\n\n", name, name, expiry)
+			fmt.Printf("  host --authkey %s --hostname %s --operator ops\n\n", key, srcHost)
+			fmt.Printf("Then, on this (operator) machine, re-present it with the CDP rewrite:\n\n")
+			fmt.Printf("  client serve-cdp %s --peer %s:%d\n\n", name, srcHost, port)
+			fmt.Printf("Consumers then attach from the tailnet to:\n")
+			fmt.Printf("  http://%s.<your-tailnet>.ts.net:%d\n", presented, port)
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&port, "cdp-port", 9222, "CDP port the host will serve on (for the printed URL)")
+	cmd.Flags().DurationVar(&expiry, "expiry", 30*time.Minute, "minted key expiry")
+	return cmd
+}
+
+func listCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List ephlink hosts on the tailnet (from the Tailscale API) with liveness.",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			secret, err := oauthSecret()
+			if err != nil {
+				return err
+			}
+			devs, err := ephlink.ListDevices(cmd.Context(), secret, "", hostTag)
+			if err != nil {
+				return err
+			}
+			if len(devs) == 0 {
+				fmt.Println("no ephlink hosts online (nothing tagged " + hostTag + ")")
+				return nil
+			}
+			for _, d := range devs {
+				status := "offline"
+				if d.Online {
+					status = "online"
+				}
+				fmt.Printf("%-28s  %-8s  %s\n", d.Hostname, status, d.Name)
+			}
+			return nil
+		},
+	}
+}
+
+func removeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "remove <name>",
+		Short: "Remove a host's node from the tailnet.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			hostname := "cdp-host-" + name + "-src" // hosts join under the -src raw name
+			secret, err := oauthSecret()
+			if err != nil {
+				return err
+			}
+			devs, err := ephlink.ListDevices(cmd.Context(), secret, "", hostTag)
+			if err != nil {
+				return err
+			}
+			var id string
+			for _, d := range devs {
+				if d.Hostname == hostname {
+					id = d.ID
+					break
+				}
+			}
+			if id == "" {
+				return fmt.Errorf("no ephlink host named %q (hostname %s) on the tailnet", name, hostname)
+			}
+			if err := ephlink.DeleteDevice(cmd.Context(), secret, "", id); err != nil {
+				return err
+			}
+			fmt.Printf("removed host %q (%s)\n", name, hostname)
+			return nil
+		},
+	}
+}
+
+func serveCDPCmd() *cobra.Command {
+	var (
+		peer    string
+		port    int
+		authKey string
+	)
+	cmd := &cobra.Command{
+		Use:   "serve-cdp <name>",
+		Short: "Re-present a raw host under cdp-host-<name> with the CDP rewrite applied.",
+		Long: "serve-cdp joins a node named cdp-host-<name>, listens on the mesh, and for each connection " +
+			"dials the raw host (--peer) over the mesh and applies the CDP Host/webSocketDebuggerUrl " +
+			"rewrite — so consumers attach to http://cdp-host-<name>.<tailnet>.ts.net:<port>. The raw " +
+			"host stays generic; all CDP logic is here, operator-side. Runs until Ctrl+C.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			presented := "cdp-host-" + name
+			if peer == "" {
+				peer = fmt.Sprintf("cdp-host-%s-src:%d", name, port)
+			}
 			key := authKey
 			if key == "" {
 				key = os.Getenv("TS_AUTHKEY")
 			}
 			if key == "" {
-				return fmt.Errorf("no auth key: pass --authkey (or $TS_AUTHKEY); mint one with the `mint` tool")
+				// Mint a presenting-node key on the fly (client-side; needs auth_keys scope).
+				secret, err := oauthSecret()
+				if err != nil {
+					return fmt.Errorf("no --authkey/$TS_AUTHKEY and cannot mint: %w", err)
+				}
+				key, err = ephlink.Mint(cmd.Context(), ephlink.MintOptions{
+					OAuthSecret: secret,
+					Tags:        []string{hostTag},
+					Expiry:      30 * time.Minute,
+					Description: "ephlink-client " + name,
+				})
+				if err != nil {
+					return err
+				}
 			}
-			if peer == "" {
-				return fmt.Errorf("--peer is required, e.g. --peer cdp-host:9222")
+
+			node, err := ephlink.Join(cmd.Context(), ephlink.Config{Hostname: presented, AuthKey: key})
+			if err != nil {
+				return err
 			}
-			return run(cmd.Context(), key, hostname, peer, localPort)
+			defer node.Close()
+			ln, err := node.ListenOnMesh(port)
+			if err != nil {
+				return err
+			}
+			nodeName, ip4 := node.Name()
+			advertise := fmt.Sprintf("%s:%d", nodeName, port)
+			// Upstream is the raw host, reached over the mesh via this node's Dial.
+			dial := func(dctx context.Context) (net.Conn, error) { return node.Dial(dctx, peer) }
+			go func() { _ = cdp.Serve(ln, advertise, peer, dial) }()
+
+			fmt.Fprintf(os.Stderr, "serving %q at http://%s:%d  (raw host %s, ip %s)\n", name, nodeName, port, peer, ip4)
+			fmt.Fprintf(os.Stderr, "  attach: chromium.connectOverCDP(\"http://%s:%d\")\n", nodeName, port)
+			fmt.Fprintln(os.Stderr, "  press Ctrl+C to stop.")
+			<-cmd.Context().Done()
+			fmt.Fprintln(os.Stderr, "\nstopping…")
+			return nil
 		},
 	}
-	f := cmd.Flags()
-	f.StringVar(&peer, "peer", "", "peer host to reach by MagicDNS name:port (e.g. cdp-host:9222)")
-	f.IntVar(&localPort, "local-port", 0, "local port to re-serve on (0 = OS picks)")
-	f.StringVar(&hostname, "hostname", "cdp-client", "MagicDNS hostname for this node on the mesh")
-	f.StringVar(&authKey, "authkey", "", "ephemeral mesh auth key (from the `mint` tool / $TS_AUTHKEY)")
-
-	if err := fang.Execute(context.Background(), cmd, fang.WithVersion(version), fang.WithNotifySignal(os.Interrupt)); err != nil {
-		os.Exit(1)
-	}
-}
-
-func run(ctx context.Context, authKey, hostname, peer string, localPort int) error {
-	// Join the mesh (ephlink handles all transport/identity/lifecycle).
-	node, err := ephlink.Join(ctx, ephlink.Config{Hostname: hostname, AuthKey: authKey})
-	if err != nil {
-		return err
-	}
-	defer node.Close()
-	fmt.Fprintf(os.Stderr, "joined mesh as %q; dialing peer %s over MagicDNS…\n", hostname, peer)
-
-	// The ONLY CDP-specific logic: a reverse proxy whose Transport dials the peer over the mesh,
-	// with the Host + webSocketDebuggerUrl rewrites. ReverseProxy handles WebSocket upgrades.
-	proxy := cdpReverseProxy(ctx, node, peer)
-
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-	if err != nil {
-		return fmt.Errorf("local listen: %w", err)
-	}
-	defer ln.Close()
-	addr := ln.Addr().(*net.TCPAddr)
-	local := fmt.Sprintf("127.0.0.1:%d", addr.Port)
-	fmt.Fprintf(os.Stderr, "CDP available locally at http://%s\n", local)
-	fmt.Fprintf(os.Stderr, "  Playwright: chromium.connectOverCDP(\"http://%s\")\n", local)
-	fmt.Fprintf(os.Stderr, "  discovery:  curl http://%s/json/version\n", local)
-
-	srv := &http.Server{Handler: withLocalAuthority(proxy, local, peer)}
-	go func() { _ = srv.Serve(ln) }()
-
-	<-ctx.Done()
-	fmt.Fprintln(os.Stderr, "\nstopping…")
-	_ = srv.Close()
-	return nil
-}
-
-// cdpReverseProxy builds the reverse proxy: rewrites Host to localhost (Chrome ≥94), dials the
-// peer over the ephlink mesh, and rewrites webSocketDebuggerUrl in JSON discovery responses.
-func cdpReverseProxy(ctx context.Context, node *ephlink.Node, peer string) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) {
-			r.Out.URL.Scheme = "http"
-			r.Out.URL.Host = peer
-			r.Out.Host = "localhost" // Chrome ≥94: Host must be localhost/IP
-		},
-		Transport: &http.Transport{
-			// Dial the peer over the mesh (MagicDNS name), regardless of the URL host.
-			DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-				return node.Dial(dctx, peer)
-			},
-		},
-		ModifyResponse: rewriteDiscoveryURLs, // set localAuthority via context (see withLocalAuthority)
-	}
-}
-
-type ctxKey string
-
-const localAuthorityKey ctxKey = "localAuthority"
-
-// withLocalAuthority injects the local authority + peer into the request context so
-// ModifyResponse can rewrite absolute upstream URLs to point back at us.
-func withLocalAuthority(h http.Handler, localAuthority, peer string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := context.WithValue(r.Context(), localAuthorityKey, [2]string{localAuthority, peer})
-		h.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// rewriteDiscoveryURLs rewrites webSocketDebuggerUrl/devtoolsFrontendUrl in /json* responses so
-// clients' follow-up WebSocket comes back through this proxy, not the (unreachable) peer authority.
-func rewriteDiscoveryURLs(resp *http.Response) error {
-	v, _ := resp.Request.Context().Value(localAuthorityKey).([2]string)
-	localAuthority, peer := v[0], v[1]
-	ct := resp.Header.Get("Content-Type")
-	if !strings.Contains(ct, "application/json") && !strings.HasPrefix(resp.Request.URL.Path, "/json") {
-		return nil
-	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil {
-		return err
-	}
-	s := string(body)
-	// Chrome emits webSocketDebuggerUrl using whatever Host it saw. Since we send Host: localhost
-	// (no port) upstream, it returns ws://localhost/devtools/... . Rewrite ANY ws authority to our
-	// local authority so the client's follow-up WebSocket returns through this proxy.
-	for _, up := range []string{
-		peer, "localhost:" + portOf(peer), "127.0.0.1:" + portOf(peer), "localhost", "127.0.0.1",
-	} {
-		if up == "" {
-			continue
-		}
-		s = strings.ReplaceAll(s, "ws://"+up+"/", "ws://"+localAuthority+"/")
-		s = strings.ReplaceAll(s, "ws="+up+"/", "ws="+localAuthority+"/")
-	}
-	resp.Body = io.NopCloser(strings.NewReader(s))
-	resp.ContentLength = int64(len(s))
-	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(s)))
-	return nil
-}
-
-func portOf(hostPort string) string {
-	if _, p, err := net.SplitHostPort(hostPort); err == nil {
-		return p
-	}
-	return ""
+	cmd.Flags().StringVar(&peer, "peer", "", "raw host to dial by MagicDNS name:port (default cdp-host-<name>-src:<port>)")
+	cmd.Flags().IntVar(&port, "cdp-port", 9222, "CDP port to dial on the raw host and serve on")
+	cmd.Flags().StringVar(&authKey, "authkey", "", "ephemeral mesh key for the presenting node (else $TS_AUTHKEY, else minted)")
+	return cmd
 }

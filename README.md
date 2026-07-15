@@ -20,15 +20,15 @@ The `cmd/` binaries use ephlink to **connect to a live user's real Chrome over t
 ```mermaid
 flowchart LR
     chrome["user's real Chrome<br/>(CDP debug port)"]
-    host["host<br/>chrome.Launch + ephlink.Expose"]
-    client["client<br/>ephlink.Dial + CDP rewrite<br/>→ ws://localhost:PORT"]
+    host["host<br/>chrome.Launch + ephlink.Expose (raw)"]
+    client["client serve-cdp<br/>ephlink.Dial + CDP rewrite<br/>→ own tailnet name"]
     clients["raw scripts · Playwright ·<br/>chrome-devtools MCP · LLM"]
     chrome -->|CDP| host
-    host -->|"ephlink mesh (WireGuard e2e, embedded tsnet, MagicDNS)"| client
-    client -->|"local CDP endpoint (Host: localhost rewrite)"| clients
+    host -->|"raw bytes over the ephlink mesh (WireGuard e2e, embedded tsnet, MagicDNS)"| client
+    client -->|"http://cdp-host-&lt;name&gt;.&lt;tailnet&gt;.ts.net:PORT"| clients
 ```
 
-The two binaries are a matched pair: **`host`** runs on the user's machine (shares their Chrome), **`client`** runs on the operator's machine (attaches to it).
+The two binaries are a matched pair: **`host`** runs on the user's machine and does a *generic raw expose* of Chrome's CDP port (it knows nothing about CDP). **`client`** runs on the operator's machine and does everything CDP-specific — it dials the raw host, applies the CDP rewrite, and re-presents it under its own tailnet name that consumers connect to. Because the CDP logic lives entirely operator-side, `host` stays reusable for any TCP service.
 
 ## Repository map
 
@@ -36,10 +36,11 @@ Single Go module (`github.com/dostarora97/ephlink`): the library is the root pac
 
 | Path | What it is |
 | --- | --- |
-| `link.go`, `mint.go` | The `ephlink` library (root package). Symmetric API — `Join` / `Expose` / `Dial` / `Serve` / `Mint`. Knows nothing about CDP. |
-| [`cmd/host`](cmd/host/README.md) | Runs on the user's Chrome machine: consent gate → launch Chrome → expose its CDP port on the mesh. |
-| [`cmd/client`](cmd/client/README.md) | Runs on the operator's machine: dial the host, rewrite CDP, re-serve as `ws://localhost:PORT`. |
+| `link.go`, `mint.go` | The `ephlink` library (root package). Symmetric API — `Join` / `Expose` / `Dial` / `Serve` / `ServeOnMesh` / `ListenOnMesh` / `Mint`. Knows nothing about CDP. |
+| [`cmd/host`](cmd/host/README.md) | Runs on the user's Chrome machine: consent gate → launch Chrome → **raw** expose its CDP port on the mesh (or serve rewritten CDP locally with `--local-only`). |
+| [`cmd/client`](cmd/client/README.md) | Runs on the operator's machine: `add`/`list`/`remove` the fleet, and `serve-cdp` to dial a raw host, rewrite CDP, and re-present it under `cdp-host-<name>.<tailnet>.ts.net`. |
 | `cmd/mint` | Operator-side minter for short-lived ephemeral mesh keys (thin CLI over `ephlink.Mint`). |
+| `internal/cdp` | The only CDP-specific code: the Host / webSocketDebuggerUrl rewrite (used by `client serve-cdp` and `host --local-only`). |
 | `internal/chrome`, `internal/consent` | Support packages for the host (Chrome discovery/launch; the consent gate). |
 | [`docs/LIBRARY.md`](docs/LIBRARY.md) | The `ephlink` library reference. |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Architecture and the full design & decision history (trade-offs, rejected alternatives, evolution). |
@@ -89,53 +90,73 @@ Use `--headless` to run Chrome without a window (smoke tests). Ctrl-C in termina
 
 ## Quickstart B — over the mesh (two machines)
 
-The real thing: `host` runs on the **user's** machine, `client` + the CDP clients on the **operator's**. Do the [one-time Tailscale setup](docs/TAILSCALE-SETUP.md) first (tags + OAuth client).
+The real thing: `host` runs on the **user's** machine, `client` + the CDP consumers on the **operator's**. Do the [one-time Tailscale setup](docs/TAILSCALE-SETUP.md) first (tags + OAuth client with `auth_keys` + `devices` scopes).
 
 ```sh
-# ── operator: mint a short-lived ephemeral key ─────────────────────────────
+# ── operator: register a host; this mints a key and prints the commands to run ──
 export TS_OAUTH_CLIENT_SECRET=tskey-client-xxxxx     # or put it in .env (see .env.example)
-HOSTKEY=$(./mint --expiry 30m)                       # defaults to --tag tag:ephlink-host
+./client add alice
+#   → prints:  host --authkey tskey-auth-… --hostname cdp-host-alice-src --operator ops
+#              client serve-cdp alice --peer cdp-host-alice-src:9222
 
-# ── user's machine: accept consent, launch Chrome, join the mesh ───────────
-./host --authkey "$HOSTKEY" --operator "support"     # hostname defaults to cdp-host
+# ── user's (alice's) machine: run the printed host command ──────────────────
+./host --authkey tskey-auth-… --hostname cdp-host-alice-src --operator ops
+#   accepts consent, launches Chrome, RAW-exposes CDP on the mesh
 
-# ── operator: dial the host by name, re-serve CDP locally ──────────────────
-CLIENTKEY=$(./mint --expiry 30m)                     # the client joins the mesh too → its own key
-./client --peer cdp-host:9222 --local-port 9333 --authkey "$CLIENTKEY"
+# ── operator: re-present alice's raw host with the CDP rewrite ──────────────
+./client serve-cdp alice --peer cdp-host-alice-src:9222
+#   → serving "alice" at http://cdp-host-alice.<tailnet>.ts.net:9222
 
-# ── operator: attach any client to the local endpoint ──────────────────────
-#   chromium.connectOverCDP("http://127.0.0.1:9333")
+# ── operator: attach any CDP consumer (from the tailnet) ───────────────────
+#   chromium.connectOverCDP("http://cdp-host-alice.<tailnet>.ts.net:9222")
 ```
 
-Both nodes join as **ephemeral** — they auto-deregister from the tailnet on exit. Quit / Ctrl-C on the host runs the full teardown: kill Chrome, delete the temp profile, drop the mesh node. See [`docs/DESIGN.md` → Teardown (D12)](docs/DESIGN.md) for the guarantees.
+Add more hosts by repeating `add` / `serve-cdp` with different names — each is its own isolated node with its own key. Manage the fleet with `client list` and `client remove <name>` (read live from the tailnet — no local database). Both nodes are **ephemeral** (auto-deregister on exit); Ctrl-C on `host` tears down Chrome + temp profile + node.
+
+## Hand a remote browser to an LLM (chrome-devtools MCP)
+
+Because the endpoint is a faithful CDP endpoint, point the [chrome-devtools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) at it with `--browserUrl` and an agentic LLM drives the remote browser as if it were local:
+
+```json
+"chrome-devtools": {
+  "command": "npx",
+  "args": ["chrome-devtools-mcp@latest",
+           "--browserUrl=http://cdp-host-alice.<tailnet>.ts.net:9222"]
+}
+```
+
+For a single-machine / sandboxed consumer, use `host --local-only` and point `--browserUrl` at the `http://127.0.0.1:PORT` it prints.
 
 ## CLI reference
 
-**host** — runs on the user's machine, where Chrome is.
+**host** — runs on the user's machine, where Chrome is. Does a raw CDP expose on the mesh.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--authkey` (`$TS_AUTHKEY`) | — | Ephemeral mesh key from `mint`. |
+| `--authkey` (`$TS_AUTHKEY`) | — | Ephemeral mesh key from `mint`/`client add` (required unless `--local-only`). |
+| `--hostname` | `cdp-host` | MagicDNS name for this node (`client add` sets `cdp-host-<name>-src`). |
+| `--cdp-port` | `9222` | Local CDP port for the launched Chrome. |
 | `--operator` | `""` | Free-text label for who's connecting (shown in the consent prompt). |
 | `--ttl` | `30 minutes` | Human-readable session duration (shown in consent). |
-| `--cdp-port` | `9222` | Local CDP port for the launched Chrome. |
-| `--hostname` | `cdp-host` | MagicDNS name for this node (the client dials this). |
 | `--headless` | `false` | Run Chrome headless (smoke tests; real sessions are headful). |
 | `--chrome-path` | auto | Override the Chrome executable. |
 | `--active` | `true` | Allow the operator to actively drive, not just observe. |
+| `--real-profile` | `false` | Copy the user's real profile — *not implemented*. |
 | `--yes` | `false` | Skip the interactive consent prompt (supervised automation). |
-| `--local-only` | `false` | Don't touch the mesh — loopback CDP only (Quickstart A). |
+| `--local-only` | `false` | Don't touch the mesh — serve rewritten CDP on loopback (no `client` needed). |
 
-**mint** — operator side. `mint [--tag tag:ephlink-host] [--expiry 30m]`, reads `TS_OAUTH_CLIENT_SECRET` (or `.env`), prints a key.
+**mint** — operator side. `mint [--tag tag:ephlink-host] [--expiry 30m]`, reads `TS_OAUTH_CLIENT_SECRET` (or `.env`), prints a `tskey-auth-…` key.
 
-**client** — operator side.
+**client** — operator side. Subcommands:
 
-| Flag | Default | Meaning |
+| Command | Flags | Meaning |
 | --- | --- | --- |
-| `--peer` | — | Host to reach, `MagicDNS-name:port` (e.g. `cdp-host:9222`). |
-| `--local-port` | `0` (OS picks) | Local port to re-serve CDP on. |
-| `--hostname` | `cdp-client` | MagicDNS name for the client node. |
-| `--authkey` (`$TS_AUTHKEY`) | — | Ephemeral mesh key for the client. |
+| `client add <name>` | `--cdp-port 9222`, `--expiry 30m` | Mint a key + print the `host` and `serve-cdp` commands. |
+| `client list` | — | List ephlink hosts (Tailscale API, tag-filtered) with online/offline. |
+| `client remove <name>` | — | Remove a host's node (`cdp-host-<name>-src`) from the tailnet. |
+| `client serve-cdp <name>` | `--peer`, `--cdp-port 9222`, `--authkey` | Dial the raw host, apply the CDP rewrite, serve under `cdp-host-<name>`. Long-running. |
+
+All three binaries also accept `--help` and `--version`.
 
 ## Configuration
 

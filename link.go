@@ -9,6 +9,8 @@
 //   - Dial(ctx, "peer:port") open a raw connection to a peer's service by MagicDNS name
 //   - Serve(...)             re-present a remote peer's service as a LOCAL listener, optionally
 //     passing each connection through a Transform (e.g. an HTTP/L7 rewrite)
+//   - ServeOnMesh(...)       serve a local service on the mesh under THIS node's name, optionally
+//     through a Transform — so the node becomes a named, rewritten endpoint on the tailnet
 //
 // Neither side is privileged. A CDP bridge is just: machine A does Expose(chromeCDP); machine B
 // does Serve(A, localPort, cdpRewrite). Swap the transform and the same library carries SSH, a
@@ -202,6 +204,57 @@ func (n *Node) Serve(ctx context.Context, peerHostPort, localListenAddr string, 
 		}
 	}()
 	return ln, nil
+}
+
+// ListenOnMesh returns a raw net.Listener bound to THIS node's tailnet name on the given port, so
+// callers can drive a full server (e.g. http.Server / httputil.ReverseProxy) over it. The listener
+// is tracked and closed by Close(). Use this for L7 protocols (HTTP/CDP) that need many requests and
+// WebSocket upgrades per connection; use ServeOnMesh for simple per-conn raw/transform relays.
+func (n *Node) ListenOnMesh(port int) (net.Listener, error) {
+	ln, err := n.srv.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return nil, fmt.Errorf("ephlink: listen on mesh :%d: %w", port, err)
+	}
+	n.listeners = append(n.listeners, ln)
+	return ln, nil
+}
+
+// ServeOnMesh listens on THIS node's tailnet name (via tsnet) on the given port, and for each
+// inbound mesh connection dials target (a local addr like "127.0.0.1:9222", or any dialable
+// host:port) and pipes the pair through transform. nil transform = raw byte splice.
+//
+// This is the mirror of Serve: Serve listens on loopback and reaches a peer; ServeOnMesh listens on
+// the mesh and reaches a local service — so the node itself becomes a named, reachable endpoint on
+// the tailnet. With a transform it applies L7 rewriting (e.g. CDP Host/webSocketDebuggerUrl) at the
+// mesh edge, so peers reach a rewritten service at this node's MagicDNS name. Non-blocking; runs
+// until the node is closed.
+func (n *Node) ServeOnMesh(ctx context.Context, port int, target string, transform Transform) error {
+	ln, err := n.srv.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("ephlink: listen on mesh :%d: %w", port, err)
+	}
+	n.listeners = append(n.listeners, ln)
+	go func() {
+		for {
+			mesh, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				local, err := net.Dial("tcp", target)
+				if err != nil {
+					_ = mesh.Close()
+					return
+				}
+				if transform != nil {
+					transform(mesh, local)
+				} else {
+					spliceConns(mesh, local)
+				}
+			}()
+		}
+	}()
+	return nil
 }
 
 // Transform processes a matched (local, remote) connection pair. nil = raw byte splice.
