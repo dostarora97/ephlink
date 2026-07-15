@@ -15,8 +15,8 @@ captures/
 secrets/
 
 # Go — compiled binaries (built in-tree during dev) + release output
-/agent
-/cdphub
+/host
+/client
 /mint
 *.exe
 dist/
