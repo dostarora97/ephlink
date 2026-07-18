@@ -92,6 +92,35 @@ This splits cleanly along the two layers:
 
 The individual primitives are all solved. The novel composition is: **a total, composable, record-everything / rewrite-anything browser-instrumentation fabric — drivable by human + agent + script simultaneously — carried over a private, zero-public-surface, ephemeral mesh, on a transport generic enough to carry anything else too.** No surveyed product combines the private-mesh transport, the full instrumentation surface, and the simultaneous human/agent/script control.
 
+## Cross-cutting concerns not yet addressed
+
+The capability list above (the instrumentation surface) describes *what* we capture and control. It does **not** yet answer the platform-level, cross-cutting questions below. These are architectural dimensions, not features — most capabilities depend on them, and leaving them implicit is how a capable prototype fails to become a platform. Enumerated here so the north star is honest about its own gaps.
+
+- **Persistence & session state.** Everything today is *live*. There is no story for saving a session and resuming it, snapshotting browser state (auth/cookies/profile — cf. Kernel's unikernel snapshot/standby), or reusing a real profile (`--real-profile` is still unbuilt). "Record everything" implies a storage + lifecycle subsystem the capability list never names.
+
+- **Storage, indexing & retrieval of captures.** Capture is only half; the artifacts (HAR, rrweb streams, video, interaction logs) must be stored, indexed, addressed, retained/purged, and encrypted at rest (ties to the D9 riders, #8). Where do captures live, in what format, keyed how? A write-only firehose is not the goal.
+
+- **A query / analysis layer over captures.** The value of "record everything" is *asking questions* of it — "every failed request across these sessions", "diff this run vs. that run", "when did this DOM node change". Capture without query is a write-only log. Entirely absent from the vision so far.
+
+- **Identity, authorization & multi-tenancy.** Access today is "possess an ephemeral key". There is no notion of *identity-scoped* access — who may attach to / observe / drive whose browser, at what privilege (observe vs. drive vs. MITM). Mandatory for anything beyond you-driving-your-own-machines. (tsidp / OIDC #20 is the seed.)
+
+- **The consumer contract (API / SDK / event schema).** The host side is specified exhaustively; the *consumer* side is not. How does a script or app subscribe to the instrumentation streams and issue control? A stable event schema, a subscription API, an SDK — this is arguably the most important missing piece for being a *platform* rather than a demo.
+
+- **Scale: multi-host × multi-session × multi-consumer.** The vision is single-session-centric. Real use is N hosts × M sessions × K consumers, needing orchestration, session discovery/lifecycle, and a control plane (fleet-MCP #22 gestures at this).
+
+- **Self-observability & backpressure.** A record-everything system that silently drops events under load is worse than none. The tool needs its own health/metrics, and defined backpressure semantics when a consumer or the mesh can't keep up.
+
+- **Failure semantics under partial capture.** When the mesh blips mid-session, what happens to in-flight capture/replay/drive? The pipeline design must define partial-failure behavior, not assume a clean pipe.
+
+- **A second, concrete non-browser cargo.** Layer 1 promises "carry anything," but until a *second* real consumer exists (SSH, a DB inspector, a dev server), "generic" is aspirational. One concrete example proves the transport claim. (#17 is the seed.)
+
+## Honest status (2026-07)
+
+- **Layer 1 (transport): ~85% built.** Join / Dial / Expose / ServeOnMesh / ListenOnMesh / Mint, ephemeral nodes, fleet management, proven Mac↔Windows. This is the hard, novel, defensible part — and it's essentially done. Remaining: genericity polish (#9, #16, #17), reaping bug (#10).
+- **Layer 2 (browser fabric): ~10% built.** Today = raw CDP passthrough + the Host/webSocketDebuggerUrl rewrite (one small first slice). The capture / MITM / replay / mirror / multi-consumer fabric is design + issues only.
+- **Effort caveat:** by feature-count, much of Layer 2 is glue over solved libraries (HAR, rrweb, screencast, MCP). By person-months, the effort is dominated by the parts that are *not* glue: the composable pipeline (#30, the linchpin), multi-consumer + human↔agent co-driving (#40), a good WebRTC mirror (#27, not a drop-in from Neko/Kernel because we have no X11 desktop), active network MITM (#33), and deterministic replay (#38).
+
 ---
 
 Tracked as a GitHub epic with one sub-issue per capability group. See the issues labeled `vision`.
+
